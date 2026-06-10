@@ -1,0 +1,49 @@
+# Route A: SigLIP2 + Projection + Qwen2-1.5B (LoRA)
+# 只使用合成数据训练（无CORD）
+
+stage:
+  name: "route_a_synthetic_only"
+  description: "纯合成数据训练 - 无CORD"
+
+model:
+  vision_model_name: "google/siglip2-base-patch16-naflex"
+  llm_type: "hf_lora"
+  hf_model_name: "Qwen/Qwen2-1.5B"
+  hf_lora_r: 16
+  hf_lora_alpha: 32
+  hf_lora_dropout: 0.05
+  llm_hidden_size: 1536
+  projection_intermediate_dim: 3072
+
+data:
+  language: "chinese"
+  train_path: "data/synthetic/train.jsonl"
+  val_path: "data/data/synthetic/val.jsonl"
+
+training:
+  epochs: 10
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 5e-5
+  warmup_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  optimizer: "adamw"
+  scheduler: "cosine"
+  mixed_precision: "bf16"
+
+freezing:
+  freeze_vision: true
+  freeze_llm_middle: true
+  trainable_llm_layers: []
+  train_projection: true
+  freeze_strategy: "projection_only"
+
+checkpointing:
+  save_every_n_epochs: 2
+  save_best_by: "val_loss"
+  output_dir: "checkpoints/route_a_synthetic"
+
+sequence:
+  max_sequence_length: 2048
+  max_num_patches: 1024

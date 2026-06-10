@@ -1,0 +1,53 @@
+# 模型配置
+model:
+  name: "ReceiptVLM"
+
+  # Vision —— 默认真·SigLIP2 NaFlex；离线/CPU 可改为 "fallback"（简易卷积编码器）
+  vision_model_name: "google/siglip2-base-patch16-naflex"
+  vision_hidden_size: 768
+  freeze_vision: true
+  max_num_patches: 256              # NaFlex 序列长度上限
+
+  # Projection
+  projection_intermediate_dim: 2048
+  projection_dropout: 0.0
+
+  # LLM
+  # llm_vocab_size 运行时由 tokenizer 决定（本项目默认用 scripts/train_tokenizer.py
+  # 训练的小词表 BPE，~6k–12k，使嵌入层与整体参数保持轻量）。此处仅作占位。
+  llm_vocab_size: 12000
+  llm_hidden_size: 512
+  llm_num_layers: 6
+  llm_num_heads: 8
+  llm_intermediate_size: 2048
+
+  # 冻结策略: "projection_only" | "projection_llm_ends"
+  freeze_strategy: "projection_llm_ends"
+
+  max_sequence_length: 1024
+  image_token_sequence_length: 576  # 仅 fallback 估算用
+
+  # Tokenizer —— 留空则优先加载本地 tokenizers/receipt-bpe/，回退 Qwen2
+  tokenizer_name: null
+
+# Stage A 训练配置 (预热/对齐)
+stage_a:
+  name: "stage_a_pretrain"
+  epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  warmup_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+# Stage B 训练配置 (中文精调)
+stage_b:
+  name: "stage_b_finetune"
+  epochs: 5
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 5e-5
+  warmup_steps: 50
+  weight_decay: 0.01
+  max_grad_norm: 1.0

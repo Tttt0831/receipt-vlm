@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Large files - keep structure but exclude large datasets
+data/raw/
+data/processed/
+data/synthetic/images/
+data/synthetic_test/
+data/test_manual/
+data/*.zip
+data/cord/images/
+
+# All model checkpoints
+checkpoints/
+checkpoints/*.pt
+checkpoints/*/*.pt
+
+# Cache
+.cache/
+*.cache
+.hypothesis/
+
+# Logs
+*.log
+logs/
+slurm_*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Hugging Face cache
+.cache/huggingface/
+
+# Compressed files
+*.tar.gz
+*.zip
+
+# Training artifacts
+training_loss_curve.png
+wandb/
+events.out.tfevents.*
+checkpoints/
+*.pt
+*.pth
+data/synthetic/images/

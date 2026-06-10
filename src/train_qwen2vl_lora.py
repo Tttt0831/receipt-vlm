@@ -1,0 +1,371 @@
+"""
+路线 B: Qwen2-VL-2B-Instruct + LoRA 微调
+
+直接使用 Qwen2-VL-2B 现成 VLM，LoRA 微调。
+与路线 A (SigLIP2+Projection+Qwen2-1.5B LoRA) 做同口径对比。
+
+显存需求: ~20-22GB (RTX 4090 24GB)
+
+用法:
+    # 完整训练
+    python src/train_qwen2vl_lora.py --data data/processed/synthetic/train.jsonl
+
+    # Smoke test
+    python src/train_qwen2vl_lora.py --max-samples 50 --epochs 1 --batch-size 1
+"""
+
+import argparse
+import json
+import os
+import sys
+import math
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Dataset
+# ═══════════════════════════════════════════════════════════════════════
+
+class QwenVLDataset(Dataset):
+    """Qwen2-VL 格式数据集。"""
+
+    def __init__(self, data_path: str, max_samples: Optional[int] = None):
+        self.samples = []
+        with open(data_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    self.samples.append(json.loads(line))
+        if max_samples and len(self.samples) > max_samples:
+            self.samples = self.samples[:max_samples]
+        print(f"Loaded {len(self.samples)} samples from {data_path}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        img_path = s["image_path"]
+        if not Path(img_path).exists():
+            img_path = REPO_ROOT / img_path
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except Exception:
+            image = Image.new("RGB", (384, 384), color="white")
+        return {
+            "image": image,
+            "target_json": s["target_json"],
+            "prompt": s.get("prompt", ""),
+            "image_path": str(img_path),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Collate — Qwen2-VL chat 格式
+# ═══════════════════════════════════════════════════════════════════════
+
+QWEN_PROMPT = (
+    "请从这张票据中抽取以下字段并以 JSON 格式输出:\n"
+    "merchant_name (商户名称), date (开票日期 YYYY-MM-DD), "
+    "total_amount (总金额), tax_amount (税额), "
+    "tax_id (纳税人识别号), invoice_no (发票号码)。\n"
+    "如果某个字段无法从票据中找到，请填 null。"
+    "只输出 JSON，不要其他文字。"
+)
+
+ENGLISH_PROMPT = (
+    "Extract the following fields from this receipt as JSON:\n"
+    "merchant_name, date (YYYY-MM-DD), total_amount, tax_amount, "
+    "tax_id, invoice_no.\n"
+    "Use null for missing fields. Output only JSON, no extra text."
+)
+
+
+def collate_qwen2vl(batch, processor, max_length=2048):
+    """构造 Qwen2-VL chat 格式 batch。"""
+    messages_list = []
+    targets = []
+
+    for item in batch:
+        is_english = "receipt_english" in item.get("image_path", "").lower()
+        prompt = ENGLISH_PROMPT if is_english else QWEN_PROMPT
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": item["image"]},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        messages_list.append(messages)
+        targets.append(item["target_json"])
+
+    # Qwen2-VL 的批量处理
+    from qwen_vl_utils import process_vision_info
+
+    texts = []
+    image_inputs_list = []
+    for msgs in messages_list:
+        text = processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
+        texts.append(text)
+        image_inputs, _ = process_vision_info(msgs)
+        image_inputs_list.append(image_inputs)
+
+    # Tokenize 文本
+    inputs = processor(
+        text=texts,
+        images=image_inputs_list,
+        padding=True,
+        return_tensors="pt",
+        max_length=max_length,
+        truncation=True,
+    )
+
+    # 构造 labels — 训练时目标为同一份 token ids
+    # 但我们需要 labels 只作用在答案部分。简化处理：对整个序列计算 loss
+    # （Qwen2-VL 的 chat template 中，assistant 回复部分在 generation_prompt 之后）
+    labels = inputs["input_ids"].clone()
+    # 将 padding token 设为 -100
+    labels[labels == processor.tokenizer.pad_token_id] = -100
+
+    return {
+        "input_ids": inputs["input_ids"],
+        "attention_mask": inputs["attention_mask"],
+        "pixel_values": inputs.get("pixel_values"),
+        "image_grid_thw": inputs.get("image_grid_thw"),
+        "mm_token_type_ids": inputs.get("mm_token_type_ids"),
+        "labels": labels,
+        "targets": targets,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Training
+# ═══════════════════════════════════════════════════════════════════════
+
+def lr_at(step, total_steps, warmup_steps, base_lr):
+    """线性 warmup + 余弦衰减。"""
+    if warmup_steps > 0 and step < warmup_steps:
+        return base_lr * step / warmup_steps
+    if total_steps <= warmup_steps:
+        return base_lr
+    progress = (step - warmup_steps) / (total_steps - warmup_steps)
+    return 0.5 * base_lr * (1 + math.cos(math.pi * min(progress, 1.0)))
+
+
+def train_one_epoch(model, loader, optimizer, device, epoch, tcfg,
+                    total_steps, step_offset, use_amp):
+    model.train()
+    total_loss = 0.0
+    n = 0
+    accum = tcfg.get("gradient_accumulation_steps", 1)
+    base_lr = float(tcfg.get("learning_rate", 2e-4))
+    warmup = tcfg.get("warmup_steps", 0)
+    max_norm = tcfg.get("max_grad_norm", 1.0)
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [train]")
+    for i, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Qwen2-VL 额外输入
+        extra = {}
+        for k in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
+            if k in batch and batch[k] is not None:
+                v = batch[k]
+                extra[k] = v.to(device) if torch.is_tensor(v) else v
+
+        with torch.set_grad_enabled(True):
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    out = model(input_ids=input_ids, attention_mask=attention_mask,
+                                labels=labels, **extra)
+                    loss = out.loss
+            else:
+                out = model(input_ids=input_ids, attention_mask=attention_mask,
+                            labels=labels, **extra)
+                loss = out.loss
+
+        (loss / accum).backward()
+
+        if (i + 1) % accum == 0:
+            for g in optimizer.param_groups:
+                g["lr"] = lr_at(step_offset + i, total_steps, warmup, base_lr)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], max_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        total_loss += loss.item()
+        n += 1
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+    return total_loss / max(n, 1)
+
+
+@torch.no_grad()
+def validate(model, loader, device, use_amp):
+    model.eval()
+    total_loss = 0.0
+    n = 0
+    for batch in tqdm(loader, desc="Validating"):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        extra = {}
+        for k in ("pixel_values", "image_grid_thw", "mm_token_type_ids"):
+            if k in batch and batch[k] is not None:
+                v = batch[k]
+                extra[k] = v.to(device) if torch.is_tensor(v) else v
+
+        if use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                out = model(input_ids=input_ids, attention_mask=attention_mask,
+                            labels=labels, **extra)
+        else:
+            out = model(input_ids=input_ids, attention_mask=attention_mask,
+                        labels=labels, **extra)
+
+        loss = out.loss
+        if torch.isfinite(loss):
+            total_loss += loss.item()
+            n += 1
+
+    return total_loss / max(n, 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Qwen2-VL-2B LoRA 微调 (路线 B)")
+    parser.add_argument("--data", default="data/synthetic/train.jsonl",
+                        help="训练数据 jsonl 路径")
+    parser.add_argument("--val-data", default="data/data/synthetic/val.jsonl",
+                        help="验证数据 jsonl 路径")
+    parser.add_argument("--model", default="Qwen/Qwen2-VL-2B-Instruct")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--output-dir", default="checkpoints/route_b")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    args = parser.parse_args()
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    use_amp = (device.type == "cuda")
+    print(f"Device: {device} | AMP: {use_amp}")
+
+    # ── 加载模型 + LoRA ──
+    print(f"\nLoading {args.model}...")
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    from peft import get_peft_model, LoraConfig, TaskType
+
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        args.model,
+        torch_dtype=torch.bfloat16 if use_amp else torch.float32,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    # ── Processor ──
+    processor = AutoProcessor.from_pretrained(
+        args.model,
+        min_pixels=256 * 28 * 28,
+        max_pixels=1280 * 28 * 28,
+        trust_remote_code=True,
+    )
+
+    # ── 数据 ──
+    train_ds = QwenVLDataset(args.data, max_samples=args.max_samples)
+    val_path = args.val_data
+    if val_path and Path(val_path).exists():
+        val_ds = QwenVLDataset(val_path, max_samples=args.max_samples)
+    else:
+        n_val = max(1, int(0.1 * len(train_ds)))
+        n_train = len(train_ds) - n_val
+        from torch.utils.data import random_split
+        train_ds, val_ds = random_split(train_ds, [n_train, n_val])
+        print(f"Split: train={n_train}, val={n_val}")
+
+    from functools import partial
+    collate_fn = partial(collate_qwen2vl, processor=processor, max_length=2048)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              collate_fn=collate_fn, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            collate_fn=collate_fn, num_workers=0)
+
+    # ── 优化器 ──
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01)
+
+    # ── 训练循环 ──
+    tcfg = {
+        "learning_rate": args.lr,
+        "gradient_accumulation_steps": args.grad_accum,
+        "warmup_steps": args.warmup,
+        "max_grad_norm": 1.0,
+    }
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = steps_per_epoch * args.epochs
+
+    out_dir = (REPO_ROOT / args.output_dir) if not Path(args.output_dir).is_absolute() \
+        else Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    best_path = out_dir / "best_model.pt"
+    best_val = float("inf")
+
+    print(f"\n{'='*50}")
+    print(f"Training: {args.epochs} epochs, {len(train_loader)} batches/epoch")
+    print(f"Checkpoint dir: {out_dir}")
+    print(f"{'='*50}")
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, tcfg,
+            total_steps, (epoch - 1) * steps_per_epoch, use_amp,
+        )
+        val_loss = validate(model, val_loader, device, use_amp)
+        print(f"Epoch {epoch}: train={train_loss:.4f}, val={val_loss:.4f}")
+
+        if val_loss < best_val:
+            best_val = val_loss
+            model.save_pretrained(out_dir / "best_lora")
+            print(f"  ✓ Saved best LoRA adapter (val={val_loss:.4f})")
+
+    print(f"\nTraining complete. Best val loss: {best_val:.4f}")
+    print(f"LoRA adapter saved at: {out_dir / 'best_lora'}")
+
+
+if __name__ == "__main__":
+    main()
