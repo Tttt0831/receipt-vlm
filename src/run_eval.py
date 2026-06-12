@@ -26,8 +26,9 @@ from src.utils.normalize import normalize_invoice_record
 
 
 def evaluate(checkpoint, data_path, max_samples, dataset_name, device,
-             max_new_tokens, temperature, output_dir):
-    inferencer = ReceiptInference(checkpoint_path=checkpoint, device=device)
+             max_new_tokens, temperature, output_dir, tokenizer_name=None):
+    inferencer = ReceiptInference(checkpoint_path=checkpoint, device=device,
+                                  tokenizer_name=tokenizer_name)
 
     dataset = ReceiptDataset(str(data_path), max_samples=max_samples, split="test")
     if len(dataset) == 0:
@@ -78,10 +79,12 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--output", default="evaluation_results/eval")
+    parser.add_argument("--tokenizer", default=None,
+                        help="显式指定 tokenizer（路线A=Qwen/Qwen2-1.5B；自制 mini 路线=tokenizers/receipt-bpe）")
     args = parser.parse_args()
 
     evaluate(args.checkpoint, args.data, args.max_samples, args.name, args.device,
-             args.max_new_tokens, args.temperature, args.output)
+             args.max_new_tokens, args.temperature, args.output, args.tokenizer)
 
 
 if __name__ == "__main__":

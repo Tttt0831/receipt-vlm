@@ -92,39 +92,49 @@ ENGLISH_PROMPT = (
 
 def collate_qwen2vl(batch, processor, max_length=2048):
     """构造 Qwen2-VL chat 格式 batch。"""
-    messages_list = []
+    user_messages_list = []
+    full_messages_list = []
     targets = []
 
     for item in batch:
         is_english = "receipt_english" in item.get("image_path", "").lower()
         prompt = ENGLISH_PROMPT if is_english else QWEN_PROMPT
+        target_text = json.dumps(item["target_json"], ensure_ascii=False)
 
-        messages = [{
+        user_messages = [{
             "role": "user",
             "content": [
                 {"type": "image", "image": item["image"]},
                 {"type": "text", "text": prompt},
             ],
         }]
-        messages_list.append(messages)
+        full_messages = user_messages + [{
+            "role": "assistant",
+            "content": [{"type": "text", "text": target_text}],
+        }]
+
+        user_messages_list.append(user_messages)
+        full_messages_list.append(full_messages)
         targets.append(item["target_json"])
 
     # Qwen2-VL 的批量处理
     from qwen_vl_utils import process_vision_info
 
-    texts = []
+    prompt_texts = []
+    full_texts = []
     image_inputs_list = []
-    for msgs in messages_list:
-        text = processor.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
-        texts.append(text)
-        image_inputs, _ = process_vision_info(msgs)
+    for user_msgs, full_msgs in zip(user_messages_list, full_messages_list):
+        prompt_texts.append(processor.apply_chat_template(
+            user_msgs, tokenize=False, add_generation_prompt=True
+        ))
+        full_texts.append(processor.apply_chat_template(
+            full_msgs, tokenize=False, add_generation_prompt=False
+        ))
+        image_inputs, _ = process_vision_info(user_msgs)
         image_inputs_list.append(image_inputs)
 
-    # Tokenize 文本
-    inputs = processor(
-        text=texts,
+    prompt_inputs = processor(
+        text=prompt_texts,
         images=image_inputs_list,
         padding=True,
         return_tensors="pt",
@@ -132,12 +142,20 @@ def collate_qwen2vl(batch, processor, max_length=2048):
         truncation=True,
     )
 
-    # 构造 labels — 训练时目标为同一份 token ids
-    # 但我们需要 labels 只作用在答案部分。简化处理：对整个序列计算 loss
-    # （Qwen2-VL 的 chat template 中，assistant 回复部分在 generation_prompt 之后）
+    inputs = processor(
+        text=full_texts,
+        images=image_inputs_list,
+        padding=True,
+        return_tensors="pt",
+        max_length=max_length,
+        truncation=True,
+    )
+
     labels = inputs["input_ids"].clone()
-    # 将 padding token 设为 -100
-    labels[labels == processor.tokenizer.pad_token_id] = -100
+    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+    for i, prompt_len in enumerate(prompt_lengths.tolist()):
+        labels[i, :prompt_len] = -100
+    labels[inputs["attention_mask"] == 0] = -100
 
     return {
         "input_ids": inputs["input_ids"],
@@ -253,9 +271,9 @@ def validate(model, loader, device, use_amp):
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen2-VL-2B LoRA 微调 (路线 B)")
-    parser.add_argument("--data", default="data/synthetic/train.jsonl",
+    parser.add_argument("--data", default="data/synthetic/train/train.jsonl",
                         help="训练数据 jsonl 路径")
-    parser.add_argument("--val-data", default="data/data/synthetic/val.jsonl",
+    parser.add_argument("--val-data", default="data/synthetic/val/val.jsonl",
                         help="验证数据 jsonl 路径")
     parser.add_argument("--model", default="Qwen/Qwen2-VL-2B-Instruct")
     parser.add_argument("--epochs", type=int, default=5)
@@ -268,7 +286,29 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--config", default=None,
+                        help="可选 yaml 配置（如 configs/route_b.yaml）；命令行参数优先级最高")
     args = parser.parse_args()
+
+    # 可选 yaml 配置：仅覆盖用户未在命令行显式指定的项（保持与路线 A/C 一致的 config 驱动）
+    if args.config:
+        import yaml
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        m, d, t, c = (cfg.get(k, {}) for k in ("model", "data", "training", "checkpointing"))
+        cli = {a.option_strings[0].lstrip("-").replace("-", "_") for a in parser._actions
+               if any(o in sys.argv for o in a.option_strings)}
+        defaults = {
+            "model": m.get("hf_model_name"), "data": d.get("train_path"),
+            "val_data": d.get("val_path"), "epochs": t.get("epochs"),
+            "batch_size": t.get("batch_size"), "grad_accum": t.get("gradient_accumulation_steps"),
+            "lr": t.get("learning_rate"), "warmup": t.get("warmup_steps"),
+            "output_dir": c.get("output_dir"), "lora_r": m.get("lora_r"),
+            "lora_alpha": m.get("lora_alpha"),
+        }
+        for k, v in defaults.items():
+            if v is not None and k not in cli:
+                setattr(args, k, v)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     use_amp = (device.type == "cuda")

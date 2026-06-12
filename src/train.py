@@ -55,7 +55,7 @@ def build_model(cfg, tokenizer, vision_model_name, device):
         llm_vocab_size=tokenizer.vocab_size,
         llm_hidden_size=model_cfg.get("llm_hidden_size", 512),
         llm_num_layers=model_cfg.get("llm_num_layers", 6),
-        llm_num_heads=8,
+        llm_num_heads=model_cfg.get("llm_num_heads", 8),
         llm_intermediate_size=model_cfg.get("llm_intermediate_size", 2048),
         hf_model_name=model_cfg.get("hf_model_name", "Qwen/Qwen2-1.5B"),
         hf_lora_r=model_cfg.get("hf_lora_r", 16),
@@ -157,6 +157,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--init-from", default=None, help="初始化权重（Stage B 加载 Stage A）")
+    parser.add_argument("--init-llm", default=None,
+                        help="载入 MiniLLM 语言预训练权重（src/pretrain_lm.py 产物）到 model.llm")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -174,8 +176,19 @@ def main():
     vision_model_name = args.vision or cfg.get("model", {}).get("vision_model_name") \
         or "google/siglip2-base-patch16-naflex"
 
-    tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer(cfg.get("model", {}).get("tokenizer_name"))
     model = build_model(cfg, tokenizer, vision_model_name, device)
+
+    # 载入 MiniLLM 语言预训练权重（Stage 0 产物）到 model.llm
+    if args.init_llm and Path(args.init_llm).exists():
+        pre = torch.load(args.init_llm, map_location=device, weights_only=False)
+        sd = pre.get("llm_state_dict", pre)
+        missing, unexpected = model.llm.load_state_dict(sd, strict=False)
+        print(f"✓ 已从 {args.init_llm} 载入 MiniLLM 语言预训练权重 "
+              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+    elif args.init_llm:
+        print(f"⚠ --init-llm 指定的文件不存在: {args.init_llm}")
+
     model.print_trainable_parameters()
 
     # 初始化权重（Stage B）

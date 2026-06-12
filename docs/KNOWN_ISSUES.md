@@ -1,14 +1,38 @@
 # 已知问题与待办（Known Issues）
 
-> 记录尚未在 GPU 环境验证/修复的技术债，避免遗忘。
+> 记录技术债与待修问题，避免遗忘。
+
+---
+
+## 0. 路线 C：全量语言预训练发散（产物为随机模型）⛔ 阻塞路线 C
+
+**严重度**: 高（路线 C 当前不可用）
+
+**状态**: 待修复
+
+### 现象
+- `src/pretrain_lm.py` 的 **smoke（80 step）正常**：loss 9.6 → 7.85，稳步下降。
+- **全量（102k step, bs=16）异常**：loss 从 9.62 起，约 4000 step 后塌成假的 `0.0000`（ppl=1.0），其后一直为 0。
+- 核验保存的 `checkpoints/route_c/llm_pretrained.pt`：在**训练数据**上 loss ≈ `ln(12000)=9.4`、next-token acc ≈ 8%、生成 `再再再再` 死循环 → **就是个随机模型**。权重无 NaN/爆炸，仅 `ln_f` 增益从 1.0 漂到 2.26，说明梯度信号几乎为 0。
+
+### 判断
+损失"假塌成 0"把梯度清零，模型根本没学到东西。语料已确认 100% 不重复（200000/200000），排除数据退化。疑因：
+- 手写 attention（`src/model/llm.py`）用 `float('-inf')` 掩码，在 **bf16 autocast** 下 softmax 可能产生 NaN/饱和，污染 loss。
+- 学习率 3e-4 对从零训练偏高，叠加上面的不稳定。
+
+### 修复方向
+- loss 计算**强制 fp32**（autocast 内显式 `.float()` 再算 CrossEntropy），或干脆把 loss 移出 autocast。
+- attention 改用 `torch.nn.functional.scaled_dot_product_attention`（数值稳定、自带 causal）替换手写 `-inf` 掩码；顺带解决长序列 O(seq²) 显存问题。
+- 降 LR（如 1e-4）+ 更长 warmup + 确认 grad clip 生效；加 loss/grad 的 NaN 守卫。
+- 修好后用"能否生成连贯中文 + held-out next-token acc"做验收，再进 Stage 1/2。
 
 ---
 
 ## 1. 路线 A (HF LoRA) 的 checkpoint 保存/加载方式低效且可能 key 不匹配
 
-**严重度**: 中（不影响 CPU 冒烟测试，但会影响 GPU 真实训练后的复现/推理）
+**严重度**: 中（已在 GPU 上确认体积问题）
 
-**状态**: 待 GPU 环境验证后修复
+**状态**: 已确认（best_model.pt 实测 4.6GB），待修复
 
 ### 现象
 

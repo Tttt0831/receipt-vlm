@@ -7,6 +7,7 @@ stage:
 
 model:
   vision_model_name: "google/siglip2-base-patch16-naflex"
+  tokenizer_name: "Qwen/Qwen2-1.5B"
   llm_type: "hf_lora"
   hf_model_name: "Qwen/Qwen2-1.5B"
   hf_lora_r: 16
@@ -17,8 +18,8 @@ model:
 
 data:
   language: "chinese"
-  train_path: "data/synthetic/train.jsonl"
-  val_path: "data/data/synthetic/val.jsonl"
+  train_path: "data/synthetic/train/train.jsonl"
+  val_path: "data/synthetic/val/val.jsonl"
 
 training:
   epochs: 10

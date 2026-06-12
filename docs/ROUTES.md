@@ -1,226 +1,100 @@
-# Receipt-VLM 训练路线对比
+# 训练路线详解
 
-本文档对比两种训练路线的技术方案、配置和使用方法。
+三条并行路线，统一合成数据（3000/500/500）与统一评估口径（`src/eval.py`）。
+
+| 路线 | 架构 | 模型规模 | 显存 | 配置 / 脚本 | 状态 |
+|------|------|----------|------|-------------|------|
+| **A** | SigLIP2 + MLP + Qwen2-1.5B LoRA | 1.5B base + LoRA | ~20GB(bs2) | `configs/route_a.yaml` · `src/train.py` | ✅ |
+| **B** | Qwen2-VL-2B-Instruct LoRA | 2B base + LoRA | ~20-22GB | `configs/route_b.yaml` · `src/train_qwen2vl_lora.py` | ✅ |
+| **C** | SigLIP2 + MLP + 自制 MiniLLM 214M | 214M(自训) | <24GB | `configs/route_c.yaml` · `src/pretrain_lm.py`+`src/train.py` | 🚧 WIP |
+
+多模态融合统一走 **LLaVA 风格**：文本里放 1 个 `<image>` 占位 token，前向时展开成 N 个视觉 patch embedding（路线 A/C 见 `src/model/vlm.py:_merge_multimodal`；路线 B 用 Qwen2-VL 原生）。
 
 ---
 
-## 📋 路线概览
-
-| 路线 | 架构 | 模型规模 | 显存需求 | 配置/脚本 |
-|------|------|----------|----------|-----------|
-| **路线A** | SigLIP2 + Projection + Qwen2-1.5B LoRA | ~1.5B (base) + LoRA | ~16-18GB | `configs/route_a_synthetic_only.yaml` |
-| **路线B** | Qwen2-VL-2B-Instruct LoRA | ~2B (base) + LoRA | ~20-22GB | `src/train_qwen2vl_lora.py` |
-
----
-
-## 路线 A: 自建 VLM (SigLIP2 + Qwen2-1.5B)
-
-### 架构图
+## 路线 A：SigLIP2 + Qwen2-1.5B（自建 VLM）
 
 ```
-输入图片
-    ↓
-SigLIP2 NaFlex 视觉编码器 (冻结)
-    ↓
-MLP Projection (可训练)
-    ↓
-Qwen2-1.5B 语言模型 + LoRA (部分可训练)
-    ↓
-结构化 JSON 输出
+图片 → SigLIP2 NaFlex(冻结) → MLP Projection(可训练) → Qwen2-1.5B + LoRA → JSON
 ```
-
-### 技术特点
-
-- **视觉编码**: SigLIP2 NaFlex，支持动态分辨率
-- **投影层**: 2层 MLP，768 → 3072 → 1536
-- **语言模型**: Qwen2-1.5B，通过 LoRA 微调
-- **冻结策略**: vision 冻结，LLM 中间层冻结
-
-### 配置参数
 
 | 参数 | 值 |
 |------|------|
 | vision_model | google/siglip2-base-patch16-naflex |
-| llm_type | hf_lora |
 | hf_model | Qwen/Qwen2-1.5B |
-| lora_r | 16 |
-| lora_alpha | 32 |
-| llm_hidden_size | 1536 |
-| max_num_patches | 1024 |
-| batch_size | 4 |
-| gradient_accumulation_steps | 4 |
-| learning_rate | 5e-5 |
-| epochs | 10 |
-
-### 训练命令
+| tokenizer | Qwen2（vocab 151649） |
+| llm_type | hf_lora（r=16, alpha=32） |
+| projection | 768 → 3072 → 1536 |
+| freeze_strategy | projection_llm_ends（projection + LoRA + embedding + 首末层） |
+| batch_size | 2（bs=4 在单卡 24GB 会 OOM） |
 
 ```bash
-cd /root/autodl-tmp/receipt-vlm
-
-# 完整训练
-python -m src.train --config configs/route_a_synthetic_only.yaml
-
-# 自定义参数
-python -m src.train \
-  --config configs/route_a_synthetic_only.yaml \
-  --epochs 10 \
-  --batch-size 4
+python -m src.train --config configs/route_a.yaml --epochs 5 --batch-size 2
+python -m src.run_eval --checkpoint checkpoints/route_a/best_model.pt \
+    --data data/synthetic/test/test.jsonl --tokenizer Qwen/Qwen2-1.5B \
+    --output evaluation_results/route_a
 ```
 
-### 优缺点
-
-**✅ 优点**
-- 轻量级架构，推理速度快
-- 模块化设计，易于调试
-- 显存需求较低（~16-18GB）
-- 支持动态分辨率输入
-
-**❌ 缺点**
-- 需要自己实现多模态融合
-- LoRA checkpoint 保存/加载较复杂
-- 效果可能不如原生VLM
+**结论**：JSON 格式 100% 合法，但**缺乏视觉接地**，内容多为幻觉 → 字段准确率低（Value Match 13.2%）。
 
 ---
 
-## 路线 B: Qwen2-VL-2B 直接微调
-
-### 架构图
+## 路线 B：Qwen2-VL-2B + LoRA（微调现成 VLM）
 
 ```
-输入图片 + 文本提示
-    ↓
-Qwen2-VL-2B-Instruct (原生VLM)
-    ↓
-LoRA 适配器 (可训练)
-    ↓
-结构化 JSON 输出
+图片 + 文本提示 → Qwen2-VL-2B-Instruct(原生 VLM) → LoRA → JSON
 ```
-
-### 技术特点
-
-- **模型**: Qwen2-VL-2B-Instruct（现成VLM）
-- **微调方式**: LoRA
-- **视觉处理**: 原生 ViT + 动态分辨率
-- **训练效率**: 直接微调，无需额外组件
-
-### 配置参数
 
 | 参数 | 值 |
 |------|------|
 | model | Qwen/Qwen2-VL-2B-Instruct |
-| lora_r | 16 |
-| lora_alpha | 32 |
-| lora_dropout | 0.05 |
-| target_modules | all-linear |
-| batch_size | 2 |
-| gradient_accumulation_steps | 8 |
+| lora | r=16, alpha=32, dropout=0.05 |
+| batch_size / grad_accum | 2 / 8 |
 | learning_rate | 2e-4 |
 | epochs | 5 |
 
-### 训练命令
-
 ```bash
-cd /root/autodl-tmp/receipt-vlm
-
-# 完整训练
-python src/train_qwen2vl_lora.py \
-  --data data/synthetic/train.jsonl \
-  --val-data data/data/synthetic/val.jsonl
-
-# 快速测试
-python src/train_qwen2vl_lora.py \
-  --max-samples 50 \
-  --epochs 1 \
-  --batch-size 1
-
-# 自定义参数
-python src/train_qwen2vl_lora.py \
-  --data data/synthetic/train.jsonl \
-  --val-data data/data/synthetic/val.jsonl \
-  --epochs 10 \
-  --batch-size 2 \
-  --grad-accum 8 \
-  --lr 2e-4 \
-  --output-dir checkpoints/route_b
+python src/train_qwen2vl_lora.py --config configs/route_b.yaml
+python -m src.run_eval --checkpoint checkpoints/route_b/best_lora \
+    --data data/synthetic/test/test.jsonl --output evaluation_results/route_b
 ```
 
-### 优缺点
-
-**✅ 优点**
-- 使用成熟的原生VLM，效果更好
-- LoRA checkpoint 保存/加载简单
-- 代码实现更简洁
-- 预训练能力强，泛化性好
-
-**❌ 缺点**
-- 显存需求较高（~20-22GB）
-- 模型较大，推理速度较慢
-- 依赖第三方模型（更新可能影响兼容性）
+**结论**：三条路线里**效果最好**（Value Match 47.5%，F1 58.5%）。原生 VLM 的视觉接地与泛化能力强；代价是模型大、推理慢。
 
 ---
 
-## 🔄 路线对比总结
+## 路线 C：SigLIP2 + 自制 MiniLLM 214M（含语言预训练）
 
-| 维度 | 路线A | 路线B |
-|------|-------|-------|
-| **模型大小** | 较小 | 较大 |
-| **显存需求** | 16-18GB | 20-22GB |
-| **推理速度** | 快 | 中等 |
-| **训练难度** | 中等 | 简单 |
-| **效果预期** | 基础 | 更好 |
-| **可维护性** | 高 | 中等 |
-| **部署成本** | 低 | 中 |
+"从零造一个小 LLM 再做 VLM"。三阶段：
 
----
+```
+Stage 0  语言预训练    src/pretrain_lm.py   MiniMind 语料上 next-token，给 LLM 语言先验
+Stage 1  模态对齐      src/train.py         冻结 LLM+Vision，只训 projection
+Stage 2  下游精调      src/train.py         解冻端层，训票据抽取
+```
 
-## 📊 数据划分
+| 组件 | 配置 |
+|------|------|
+| MiniLLM | `h1024 / L16 / heads16 / inter4096 ≈ 213.8M`（`src/model/llm.py`） |
+| 架构 | RoPE + MHA + GELU-FFN + Pre-LN + 权重绑定 |
+| tokenizer | 自训练 ~12k BPE（`src/train_tokenizer.py` → `tokenizers/receipt-bpe/`） |
+| 预训练语料 | MiniMind `pretrain_t2t_mini.jsonl`（通用中文，~280M token） |
 
-所有路线使用相同的合成数据（5000/500/500划分）：
+```bash
+python -m src.train_tokenizer --vocab-size 12000
+python -m src.pretrain_lm --epochs 3 --batch-size 16     # ⚠️ 当前不稳定
+python -m src.train --config configs/route_c.yaml \
+    --init-llm checkpoints/route_c/llm_pretrained.pt
+```
 
-| 用途 | 路径 | 样本数 |
-|------|------|--------|
-| 训练集 | `data/synthetic/train.jsonl` | 5000 |
-| 验证集 | `data/data/synthetic/val.jsonl` | 500 |
-| 测试集 | `data/data/synthetic/test.jsonl` | 500 |
+**为什么需要语言预训练**：随机初始化的 LLM 没有任何语言能力；路线 A 能跑是因为 Qwen2 自带预训练先验。要用自制 LLM 就必须先补上这一步。3000 条票据远不够，需 GB 级通用语料（参考 MiniMind 用序列猴子/匠数等约 0.7–4B token）。
 
----
-
-## 🎯 推荐选择
-
-### 选择路线A如果：
-- 显存有限（<20GB）
-- 需要快速推理
-- 希望完全控制模型架构
-- 追求轻量化部署
-
-### 选择路线B如果：
-- 有足够显存（≥20GB）
-- 追求最佳效果
-- 希望快速实现
-- 依赖成熟VLM的泛化能力
+**当前状态**：管线跑通，但**全量预训练发散**（loss 假塌成 0、产物为随机模型）。详见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)。
 
 ---
 
-## 📝 训练检查清单
+## 选择建议
 
-### 路线A训练前检查
-
-- [x] 数据路径正确
-- [ ] Qwen/Qwen2-1.5B 模型已下载
-- [ ] LoRA 配置正确
-- [ ] 显存充足
-
-### 路线B训练前检查
-
-- [x] 数据路径正确
-- [ ] Qwen/Qwen2-VL-2B-Instruct 模型已下载
-- [ ] transformers 版本兼容
-- [ ] 显存充足（≥20GB）
-
----
-
-## 🔗 相关文档
-
-- [项目README](../README.md)
-- [已知问题](KNOWN_ISSUES.md)
-- [数据指南](DATA_GUIDE.md)
+- **要能用的结果**：路线 B。
+- **要轻量/可控架构**：路线 A（需解决接地）或路线 C（需先修预训练）。
+- **数据划分**：三条路线共用 `data/synthetic/{train,val,test}/*.jsonl`（3000/500/500）。

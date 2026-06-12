@@ -136,26 +136,35 @@ class SigLIP2VisionEncoder(nn.Module):
         """真·SigLIP2 NaFlex 前向。"""
         vision_model = self.model.vision_model
         pixel_values = inputs["pixel_values"]
-        pixel_attention_mask = inputs.get("pixel_attention_mask")
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = inputs.get("pixel_attention_mask")
         spatial_shapes = inputs.get("spatial_shapes")
 
         # 如果 processor 没有提供这些必需的参数，需要构造默认值
-        if pixel_attention_mask is None:
-            # pixel_attention_mask: [B, H, W] 标记哪些像素是有效的
-            b, c, h, w = pixel_values.shape
-            pixel_attention_mask = torch.ones((b, h, w), dtype=torch.long, device=pixel_values.device)
+        if attention_mask is None:
+            if pixel_values.dim() == 3:
+                b, p, _ = pixel_values.shape
+                attention_mask = torch.ones((b, p), dtype=torch.long, device=pixel_values.device)
+            else:
+                b, _, h, w = pixel_values.shape
+                attention_mask = torch.ones((b, h * w), dtype=torch.long, device=pixel_values.device)
 
         if spatial_shapes is None:
-            # spatial_shapes: [B, 2] 每个样本的 (height, width)
-            b, c, h, w = pixel_values.shape
-            spatial_shapes = torch.tensor([[h, w]], dtype=torch.long, device=pixel_values.device)
-            if b > 1:
-                spatial_shapes = spatial_shapes.repeat(b, 1)
+            if pixel_values.dim() == 4:
+                b, _, h, w = pixel_values.shape
+                spatial_shapes = torch.tensor([[h, w]], dtype=torch.long, device=pixel_values.device)
+                if b > 1:
+                    spatial_shapes = spatial_shapes.repeat(b, 1)
+            else:
+                b, p, _ = pixel_values.shape
+                spatial_shapes = torch.tensor([[1, p]], dtype=torch.long, device=pixel_values.device)
+                if b > 1:
+                    spatial_shapes = spatial_shapes.repeat(b, 1)
 
-        # 调用 SigLIP2 vision_model - 使用正确的参数名
         outputs = vision_model(
             pixel_values=pixel_values,
-            pixel_attention_mask=pixel_attention_mask,
+            attention_mask=attention_mask,
             spatial_shapes=spatial_shapes,
         )
         last_hidden = outputs.last_hidden_state  # [B, P, hidden]

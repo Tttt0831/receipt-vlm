@@ -1,0 +1,19 @@
+{
+  "dataset": "route_b_test",
+  "num_samples": 500,
+  "acc_merchant_name": 0.234,
+  "acc_date": 0.366,
+  "acc_total_amount": 0.672,
+  "acc_tax_amount": 0.746,
+  "acc_tax_id": 0.416,
+  "acc_invoice_no": 0.416,
+  "value_match_rate": 0.475,
+  "precision": 0.947008547008547,
+  "recall": 0.4227394124380008,
+  "f1": 0.5845423371142179,
+  "ned_merchant_name": 0.6554617569564938,
+  "json_validity_rate": 1.0,
+  "hallucination_rate": 0.16358839050131926,
+  "checkpoint": "/home1/jiajunjie/receipt-vlm/checkpoints/route_b/best_lora",
+  "trained": true
+}

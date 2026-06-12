@@ -14,6 +14,9 @@ from typing import Dict, Any, Optional, List
 
 import torch
 from PIL import Image
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from peft import PeftModel
+from qwen_vl_utils import process_vision_info
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -24,6 +27,50 @@ from src.model.tokenizer import get_tokenizer
 DEFAULT_PROMPT = """请从这张票据中抽取以下字段并以 JSON 输出:
 merchant_name, date, total_amount, tax_amount, tax_id, invoice_no。
 缺失字段填 null,不要编造。"""
+
+QWEN2_VL_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
+
+
+def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """扫描出第一个**配对完整**的 {...} 对象并解析。
+
+    模型常在合法 JSON 之后继续生成（重复、特殊 token、乱码），导致整体串无法解析；
+    贪婪的 `\\{.*\\}` 会从第一个 { 跨到最后一个 }，反而把多个对象粘在一起。
+    这里按花括号配平取第一个对象，能从尾部带垃圾的输出里救回结果。
+    """
+    start = text.find('{')
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+        start = text.find('{', start + 1)
+    return None
+
+
+def is_route_b_lora_path(checkpoint_path: Optional[str]) -> bool:
+    if not checkpoint_path:
+        return False
+    path = Path(checkpoint_path)
+    return path.is_dir() and (path / "adapter_config.json").exists() and (path / "adapter_model.safetensors").exists()
 
 
 def build_vlm(checkpoint, tokenizer, device, fallback_vision="google/siglip2-base-patch16-naflex"):
@@ -62,11 +109,31 @@ class ReceiptInference:
                  device: Optional[str] = None,
                  tokenizer_name: Optional[str] = None):
         self.device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.checkpoint_path = checkpoint_path
+        self.mode = "route_b" if is_route_b_lora_path(checkpoint_path) else "route_a"
+        self.has_checkpoint = False
+        self.processor = None
+        self.tokenizer = None
+
+        if self.mode == "route_b":
+            print(f'Loading Qwen2-VL route B model on {self.device}...')
+            base_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                QWEN2_VL_MODEL,
+                torch_dtype=torch.bfloat16 if self.device.type == 'cuda' else torch.float32,
+                trust_remote_code=True,
+            )
+            self.model = PeftModel.from_pretrained(base_model, checkpoint_path)
+            self.model.to(self.device)
+            self.processor = AutoProcessor.from_pretrained(QWEN2_VL_MODEL, trust_remote_code=True)
+            self.has_checkpoint = True
+            self.model.eval()
+            print(f'✓ Loaded route B LoRA adapter from {checkpoint_path}')
+            print(f'✓ Inference engine ready on {self.device}')
+            return
 
         print('Loading tokenizer...')
         self.tokenizer = get_tokenizer(tokenizer_name)
 
-        # 先尝试读 checkpoint（拿 model_config）
         checkpoint = None
         if checkpoint_path and Path(checkpoint_path).exists():
             try:
@@ -77,7 +144,6 @@ class ReceiptInference:
         print(f'Building model on {self.device}...')
         self.model = build_vlm(checkpoint, self.tokenizer, self.device)
 
-        self.has_checkpoint = False
         if checkpoint is not None:
             try:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -101,23 +167,58 @@ class ReceiptInference:
                       temperature: float = 0.7,
                       top_p: float = 0.9) -> Dict[str, Any]:
         """图片 → 预测 JSON dict。"""
-        vision_inputs = self.model.vision_encoder.process_images([image.convert('RGB')], device=self.device)
-
-        output_text = self.model.generate(
-            vision_inputs=vision_inputs,
-            prompt=prompt,
-            tokenizer=self.tokenizer,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-        )
+        if self.mode == "route_b":
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image.convert('RGB')},
+                    {"type": "text", "text": prompt.replace('<image>', '').strip()},
+                ],
+            }]
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            image_inputs, _ = process_vision_info(messages)
+            inputs = self.processor(
+                text=[text],
+                images=[image_inputs],
+                padding=True,
+                return_tensors='pt',
+            )
+            inputs = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=temperature > 0,
+            )
+            prompt_len = inputs['input_ids'].shape[1]
+            output_text = self.processor.tokenizer.decode(
+                generated_ids[0][prompt_len:],
+                skip_special_tokens=True,
+            )
+        else:
+            vision_inputs = self.model.vision_encoder.process_images([image.convert('RGB')], device=self.device)
+            output_text = self.model.generate(
+                vision_inputs=vision_inputs,
+                prompt=prompt,
+                tokenizer=self.tokenizer,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
 
         try:
             return json.loads(output_text)
         except json.JSONDecodeError:
-            extracted = self.tokenizer.extract_json_from_output(output_text)
-            if extracted is not None:
-                return extracted
+            # 优先取第一个配平完整的 JSON 对象（容忍尾部重复/乱码）
+            first = extract_first_json_object(output_text)
+            if first is not None:
+                return first
+            extractor = self.tokenizer.extract_json_from_output if self.tokenizer is not None else None
+            if extractor is not None:
+                extracted = extractor(output_text)
+                if extracted is not None:
+                    return extracted
             return {'error': 'Failed to parse model output as JSON', 'raw_output': output_text}
 
     def batch_infer(self,

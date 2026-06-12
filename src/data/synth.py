@@ -39,6 +39,11 @@ CHINESE_FONTS = [
     "C:\\Windows\\Fonts\\simkai.ttf",     # 楷体
     "C:\\Windows\\Fonts\\simfang.ttf",    # 仿宋
     "C:\\Windows\\Fonts\\simhei.ttf",     # 黑体
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/arphic/ukai.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/System/Library/Fonts/PingFang.ttc",

@@ -1,0 +1,19 @@
+{
+  "dataset": "route_a_test",
+  "num_samples": 500,
+  "acc_merchant_name": 0.028,
+  "acc_date": 0.0,
+  "acc_total_amount": 0.0,
+  "acc_tax_amount": 0.206,
+  "acc_tax_id": 0.334,
+  "acc_invoice_no": 0.222,
+  "value_match_rate": 0.13166666666666665,
+  "precision": 0.7222222222222222,
+  "recall": 0.009919877909194963,
+  "f1": 0.019570944674444857,
+  "ned_merchant_name": 0.7968960735171261,
+  "json_validity_rate": 1.0,
+  "hallucination_rate": 0.026385224274406333,
+  "checkpoint": "checkpoints/route_a_synthetic/best_model.pt",
+  "trained": true
+}

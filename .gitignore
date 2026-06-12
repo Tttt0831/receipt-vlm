@@ -83,3 +83,8 @@ checkpoints/
 *.pt
 *.pth
 data/synthetic/images/
+
+# ── Datasets & corpora: never upload large data ──
+data/corpus/
+data/synthetic/
+data/synthetic_font_check/
