@@ -50,6 +50,7 @@ def build_model(cfg, tokenizer, vision_model_name, device):
     vlm_config = VLMConfig(
         vision_model_name=vision_model_name,
         freeze_vision=freezing.get("freeze_vision", True),
+        vision_trainable_layers=freezing.get("vision_trainable_layers", 0),
         max_num_patches=seq.get("max_num_patches", 256),
         llm_type=model_cfg.get("llm_type", "mini"),
         llm_vocab_size=tokenizer.vocab_size,
@@ -132,8 +133,9 @@ def run_epoch(model, loader, optimizer, device, train, epoch, tcfg, total_steps,
         if train:
             (loss / accum).backward()
             if (i + 1) % accum == 0:
+                sched_lr = lr_at(step_offset + i, total_steps, warmup, base_lr)
                 for g in optimizer.param_groups:
-                    g["lr"] = lr_at(step_offset + i, total_steps, warmup, base_lr)
+                    g["lr"] = sched_lr * g.get("lr_scale", 1.0)
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], max_norm)
                 optimizer.step()
@@ -212,9 +214,19 @@ def main():
     train_loader, val_loader = make_loaders(
         train_path, val_path, args.max_samples, tcfg.get("batch_size", 4), collate)
 
-    # 优化器（只优化可训练参数）
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=float(tcfg.get("learning_rate", 1e-4)),
+    # 优化器（只优化可训练参数）。视觉解冻层用更小的 lr，避免破坏预训练特征。
+    base_lr = float(tcfg.get("learning_rate", 1e-4))
+    vis_scale = float(tcfg.get("vision_lr_scale", 0.1))
+    vis_params = [p for n, p in model.named_parameters()
+                  if p.requires_grad and n.startswith("vision_encoder.")]
+    other_params = [p for n, p in model.named_parameters()
+                    if p.requires_grad and not n.startswith("vision_encoder.")]
+    param_groups = [{"params": other_params, "lr": base_lr, "lr_scale": 1.0}]
+    if vis_params:
+        param_groups.append({"params": vis_params, "lr": base_lr * vis_scale, "lr_scale": vis_scale})
+        print(f"✓ 优化器分组: 其他 {sum(p.numel() for p in other_params)/1e6:.1f}M @ lr={base_lr}, "
+              f"视觉 {sum(p.numel() for p in vis_params)/1e6:.1f}M @ lr={base_lr*vis_scale}")
+    optimizer = torch.optim.AdamW(param_groups, lr=base_lr,
                                   weight_decay=float(tcfg.get("weight_decay", 0.01)))
 
     epochs = tcfg.get("epochs", 3)

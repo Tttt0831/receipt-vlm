@@ -23,6 +23,7 @@ class VLMConfig:
     vision_model_name: str = "google/siglip2-base-patch16-naflex"
     vision_hidden_size: int = 768
     freeze_vision: bool = True
+    vision_trainable_layers: int = 0   # >0 时解冻 vision 顶部若干层（联合微调）
     max_num_patches: int = 256
 
     # Projection
@@ -127,6 +128,12 @@ class ReceiptVLM(nn.Module):
         # projection 恒可训练
         for p in self.projection.parameters():
             p.requires_grad = True
+
+        # 视觉部分解冻（顶部若干层）——用于联合微调增强视觉接地
+        n_vis = getattr(self.config, "vision_trainable_layers", 0)
+        if n_vis and n_vis > 0:
+            n = self.vision_encoder.set_top_trainable(n_vis)
+            print(f"✓ 视觉部分解冻: 顶部 {n_vis} 层 + post_layernorm，可训练 {n/1e6:.2f}M")
 
         if self._hf_llm:
             # HF LLM: LoRA 适配器已由 PEFT 设为 trainable

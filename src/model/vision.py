@@ -71,6 +71,25 @@ class SigLIP2VisionEncoder(nn.Module):
                 param.requires_grad = False
             self.model.eval()
 
+    def set_top_trainable(self, num_layers: int) -> int:
+        """部分解冻：放开 vision_model 顶部 num_layers 个 encoder 层 + post_layernorm。
+
+        用于路线 A 的视觉+投影联合微调，增强视觉接地。返回解冻的参数量。
+        """
+        if self.model is None or num_layers <= 0:
+            return 0
+        vm = self.model.vision_model
+        trainable = 0
+        for layer in vm.encoder.layers[-num_layers:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+                trainable += p.numel()
+        if hasattr(vm, "post_layernorm"):
+            for p in vm.post_layernorm.parameters():
+                p.requires_grad = True
+                trainable += p.numel()
+        return trainable
+
     # ---------------------------------------------------------------- #
     # 预处理：把 PIL 图片列表转成编码器需要的输入
     # ---------------------------------------------------------------- #

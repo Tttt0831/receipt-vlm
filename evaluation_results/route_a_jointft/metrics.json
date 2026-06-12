@@ -1,0 +1,19 @@
+{
+  "dataset": "route_a_jointft",
+  "num_samples": 500,
+  "acc_merchant_name": 0.384,
+  "acc_date": 0.004,
+  "acc_total_amount": 0.0,
+  "acc_tax_amount": 0.206,
+  "acc_tax_id": 0.338,
+  "acc_invoice_no": 0.12,
+  "value_match_rate": 0.17533333333333334,
+  "precision": 0.7732342007434945,
+  "recall": 0.0793590232735597,
+  "f1": 0.14394463667820068,
+  "ned_merchant_name": 0.4745714607030396,
+  "json_validity_rate": 1.0,
+  "hallucination_rate": 0.16094986807387862,
+  "checkpoint": "checkpoints/route_a_jointft/best_model.pt",
+  "trained": true
+}
