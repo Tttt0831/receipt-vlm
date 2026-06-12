@@ -37,6 +37,8 @@ python -m src.run_eval --checkpoint checkpoints/route_a/best_model.pt \
 
 **结论**：JSON 格式 100% 合法，但**缺乏视觉接地**，内容多为幻觉 → 字段准确率低（Value Match 13.2%）。
 
+**变体 `configs/route_a_jointft.yaml`（视觉+投影联合微调）**：解冻 SigLIP2 顶部 2 层 + post_layernorm（视觉用 1/10 小 lr），与 projection/LoRA 联合训练。merchant_name 2.8%→**38.4%**、F1 1.96%→**14.39%**、Value Match→17.53%，证明解冻视觉能增强接地（金额/日期仍待解决）。基线配置 `route_a.yaml` 保留作对比。
+
 ---
 
 ## 路线 B：Qwen2-VL-2B + LoRA（微调现成 VLM）

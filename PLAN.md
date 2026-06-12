@@ -29,6 +29,21 @@
 
 **核心问题：缺乏视觉接地**。模型学会了输出格式完美的 JSON，但内容是**幻觉**（编一张像样的票），不是真正读图。低 train/val loss 与高准确率脱节。另有"不输出 `<eoa>`、生成停不下来"导致 Recall≈1%，已在 `src/infer.py` 加入配平 JSON 提取容错。
 
+### 路线 A 消融：视觉解冻（基线保留作对比）
+
+变体 `configs/route_a_jointft.yaml`：解冻 SigLIP2 顶部 2 层 + post_layernorm，与 projection/LoRA 联合微调（视觉 lr=5e-6）。
+
+| 指标 | A 基线(冻结) | A 联合微调(解冻顶2层) |
+|------|:-----------:|:--------------------:|
+| merchant_name | 2.80% | **38.40%** |
+| total_amount | 0.00% | 0.00% |
+| Value Match | 13.17% | **17.53%** |
+| Recall | 0.99% | **7.94%** |
+| F1 | 1.96% | **14.39%** |
+| val loss | 0.873 | **0.847** |
+
+**结论**：解冻视觉显著增强接地，merchant_name 2.8%→38.4%、F1 翻约 7 倍；但金额/日期仍为 0，密集小数字接地更难。两套 checkpoint/评估都保留：`evaluation_results/route_a`（基线）与 `evaluation_results/route_a_jointft`。
+
 ## 路线 B 结果（5 epoch）
 
 | 字段 | 准确率 | | 总体 | 得分 |

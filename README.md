@@ -87,7 +87,28 @@
 
 **结论**：
 - **路线 B 明显领先**，金额字段（total/tax）表现好；merchant_name 仍是短板。
-- **路线 A 效果很差**：JSON 格式 100% 合法，但内容基本是**幻觉**——输出一张"看起来像"的票据而非真正读图（缺乏视觉接地）。Recall≈1% 主要是模型不输出 `<eoa>`、生成停不下来导致；[`src/infer.py`](src/infer.py) 已加入"取第一个配平 JSON 对象"的容错提取。这是自建轻量 VLM 在小数据下的固有难点。
+- **路线 A 基线效果很差**：JSON 格式 100% 合法，但内容基本是**幻觉**——输出一张"看起来像"的票据而非真正读图（缺乏视觉接地）。Recall≈1% 部分由模型不输出 `<eoa>`、生成停不下来导致；[`src/infer.py`](src/infer.py) 已加入"取第一个配平 JSON 对象"的容错提取。
+
+### 路线 A 消融：冻结视觉 vs 视觉+投影联合微调
+
+针对"缺乏视觉接地"的问题，做了对照实验：基线把 SigLIP2 全冻结，变体（[`configs/route_a_jointft.yaml`](configs/route_a_jointft.yaml)）解冻 SigLIP2 **顶部 2 层 + post_layernorm** 与 projection、LoRA 联合微调（视觉用 1/10 的小 lr）。两者都训 5 epoch、同一测试集。
+
+| 指标 | A 基线（冻结视觉） | **A 联合微调（解冻顶部2层）** |
+|------|:-----------------:|:----------------------------:|
+| merchant_name | 2.80% | **38.40%** |
+| date | 0.00% | 0.40% |
+| total_amount | 0.00% | 0.00% |
+| tax_amount | 20.60% | 20.60% |
+| tax_id | 33.40% | 33.80% |
+| invoice_no | 22.20% | 12.00% |
+| Value Match Rate | 13.17% | **17.53%** |
+| Recall | 0.99% | **7.94%** |
+| F1 Score | 1.96% | **14.39%** |
+| val loss | 0.873 | **0.847** |
+
+> 结果文件：[`evaluation_results/route_a/`](evaluation_results/route_a)（基线）· [`evaluation_results/route_a_jointft/`](evaluation_results/route_a_jointft)（联合微调）
+
+**发现**：解冻视觉**显著增强了接地**——merchant_name 从 2.8% 跃升到 **38.4%**，F1 翻约 7 倍，模型开始真正"读出"商户名。但 **total_amount / date 仍为 0**：密集小数字的接地更难，仅解冻顶部 2 层 + 短训不足以覆盖。后续方向：解冻更多视觉层、提高 `max_num_patches`、更长训练、对数字字段加权。
 
 ---
 
@@ -104,6 +125,18 @@
 | 5 | 0.8687 | 0.8727 |
 
 val 在第 4–5 epoch 基本收敛（边际收益递减）。注意：低 train/val loss ≠ 高抽取准确率——见上文"缺乏视觉接地"。
+
+**路线 A 联合微调**（解冻视觉顶部 2 层，`configs/route_a_jointft.yaml`，5 epoch）：
+
+| Epoch | Train Loss | Val Loss |
+|:-----:|:----------:|:--------:|
+| 1 | 1.0670 | 0.8944 |
+| 2 | 0.8863 | 0.8704 |
+| 3 | 0.8660 | 0.8517 |
+| 4 | 0.8513 | 0.8471 |
+| 5 | 0.8452 | **0.8469** |
+
+解冻视觉后 val loss（0.847）低于基线（0.873），且抽取指标显著改善（见上方消融表）。
 
 ### 路线 B（`configs/route_b.yaml`，5 epoch，bs=2，grad_accum=8）
 训练 5 epoch 后达到上表评估指标（per-epoch 曲线未单独留存）。
