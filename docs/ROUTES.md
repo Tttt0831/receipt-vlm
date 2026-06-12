@@ -77,8 +77,8 @@ Stage 2  下游精调      src/train.py         解冻端层，训票据抽取
 
 | 组件 | 配置 |
 |------|------|
-| MiniLLM | `h1024 / L16 / heads16 / inter4096 ≈ 213.8M`（`src/model/llm.py`） |
-| 架构 | RoPE + MHA + GELU-FFN + Pre-LN + 权重绑定 |
+| MiniLLM | `h1024 / L16 / heads16 / inter2752 ≈ 214.7M`（`src/model/llm.py`） |
+| 架构 | **对齐 MiniMind**：RoPE + SDPA 注意力 + RMSNorm + SwiGLU + 权重绑定 |
 | tokenizer | 自训练 ~12k BPE（`src/train_tokenizer.py` → `tokenizers/receipt-bpe/`） |
 | 预训练语料 | MiniMind `pretrain_t2t_mini.jsonl`（通用中文，~280M token） |
 
@@ -91,7 +91,7 @@ python -m src.train --config configs/route_c.yaml \
 
 **为什么需要语言预训练**：随机初始化的 LLM 没有任何语言能力；路线 A 能跑是因为 Qwen2 自带预训练先验。要用自制 LLM 就必须先补上这一步。3000 条票据远不够，需 GB 级通用语料（参考 MiniMind 用序列猴子/匠数等约 0.7–4B token）。
 
-**当前状态**：管线跑通，但**全量预训练发散**（loss 假塌成 0、产物为随机模型）。详见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)。
+**当前状态**：早期全量预训练发散（loss 假塌成 0、产物为随机模型）。已**对齐 MiniMind 重写** `MiniLLM`（SDPA/RMSNorm/SwiGLU + fp32 loss + 降 lr）修复数值稳定性，forward/backward 已验证，**待重训验证**。详见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)。
 
 ---
 

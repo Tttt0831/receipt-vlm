@@ -88,8 +88,8 @@ def main():
     ap.add_argument("--max-lines", type=int, default=300000)
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch-size", type=int, default=24)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--warmup", type=int, default=200)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -141,15 +141,16 @@ def main():
         optim.zero_grad()
         for i, input_ids in enumerate(pbar):
             input_ids = input_ids.to(device)
-            attn = torch.ones_like(input_ids)
             with torch.set_grad_enabled(True):
+                # 纯 causal LM（attention_mask=None → SDPA is_causal）
                 if use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        logits = model(input_ids, attn)
-                        loss = loss_fct(logits[:, :-1].reshape(-1, vocab_size), input_ids[:, 1:].reshape(-1))
+                        logits = model(input_ids)
                 else:
-                    logits = model(input_ids, attn)
-                    loss = loss_fct(logits[:, :-1].reshape(-1, vocab_size), input_ids[:, 1:].reshape(-1))
+                    logits = model(input_ids)
+                # loss 强制 fp32，避免 bf16 数值问题污染梯度
+                loss = loss_fct(logits[:, :-1].float().reshape(-1, vocab_size),
+                                input_ids[:, 1:].reshape(-1))
             (loss / args.grad_accum).backward()
             if (i + 1) % args.grad_accum == 0:
                 for g in optim.param_groups:

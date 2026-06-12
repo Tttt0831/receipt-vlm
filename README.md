@@ -47,12 +47,12 @@
 
 ### 路线 C：SigLIP2 + 自制 MiniLLM 214M（含语言预训练）
 这是"从零造一个小语言模型再做 VLM"的探索：
-- 语言模型 `MiniLLM`（[`src/model/llm.py`](src/model/llm.py)）：decoder-only，RoPE + MHA + GELU-FFN + Pre-LN + 权重绑定，配置 `h1024 / L16 / heads16 / inter4096 ≈ 214M`
+- 语言模型 `MiniLLM`（[`src/model/llm.py`](src/model/llm.py)）：decoder-only，**对齐 MiniMind**——RoPE + SDPA 注意力 + RMSNorm + SwiGLU + 权重绑定，配置 `h1024 / L16 / heads16 / inter2752 ≈ 214M`
 - 自训练 ~12k BPE tokenizer（[`src/train_tokenizer.py`](src/train_tokenizer.py) → `tokenizers/receipt-bpe/`），让小模型 embedding 不爆
 - **Stage 0 语言预训练**（[`src/pretrain_lm.py`](src/pretrain_lm.py)）：在 MiniMind 通用中文语料上做 next-token，给随机初始化的 LLM 一个语言先验
 - **Stage 1/2**：再用 `src/train.py --init-llm` 载入预训练权重，做 VLM 对齐 + 票据精调
 
-> ⚠️ **当前状态**：tokenizer、配置、预训练/对齐/精调的完整管线已搭好并能跑通，但**全量语言预训练目前不稳定**（损失会塌成一个假的 0、产物退化为随机模型，疑似手写 attention 的 `-inf` 掩码在 bf16 下不稳定 + 学习率偏高）。因此路线 C **暂无可用下游结果**，正在修复。详见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
+> ⚠️ **当前状态**：早期全量预训练曾因手写 attention 的 `-inf` 掩码在 bf16 下不稳定而发散（损失塌成假的 0、产物退化为随机模型）。现已**对齐 MiniMind 重写** `MiniLLM`（SDPA 注意力 + RMSNorm + SwiGLU）并把 loss 强制 fp32、降低 lr——数值稳定性问题已修复（forward/backward 已验证），但**尚未重新跑全量预训练验证最终效果**，故路线 C 仍标 WIP、暂无下游结果。详见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
 
 ---
 
@@ -142,8 +142,8 @@ val 在第 4–5 epoch 基本收敛（边际收益递减）。注意：低 train
 训练 5 epoch 后达到上表评估指标（per-epoch 曲线未单独留存）。
 
 ### 路线 C（语言预训练，214M MiniLLM）
-- smoke（80 step）正常：loss 9.6 → 7.85
-- 全量（102k step）**异常**：loss 9.62 起，~4000 step 后塌成假 0，产物为随机模型 → 待修复
+- 早期全量（102k step）发散：loss ~4000 step 后塌成假 0、产物为随机模型。
+- 已对齐 MiniMind 重写（SDPA/RMSNorm/SwiGLU + fp32 loss + 降 lr），数值稳定性已修；**待重新训练补曲线**。
 
 ---
 

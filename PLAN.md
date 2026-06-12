@@ -61,11 +61,11 @@
 
 已完成：
 - 自训练 ~12k BPE tokenizer（`tokenizers/receipt-bpe/`，self-check 通过）
-- MiniLLM 配置 `h1024/L16/heads16/inter4096 = 213.8M`
-- 完整管线：语言预训练（Stage 0）→ `--init-llm` 载入 → VLM 对齐/精调（Stage 1/2），smoke 全程跑通
-- 修正 `train.py` 的 `llm_num_heads` 硬编码 bug（原来恒为 8，导致与预训练 head 数不一致）
+- MiniLLM **对齐 MiniMind 重写**：SDPA 注意力 + RMSNorm + SwiGLU，配置 `h1024/L16/heads16/inter2752 = 214.7M`
+- 完整管线：语言预训练（Stage 0）→ `--init-llm` 载入 → VLM 对齐/精调（Stage 1/2），forward/backward 已验证
+- 修正 `train.py` 的 `llm_num_heads` 硬编码 bug；`pretrain_lm.py` loss 改 fp32、降 lr
 
-**未完成 / 阻塞**：全量语言预训练发散——损失 9.62 起、约 4000 step 后塌成假的 0，保存的 LM 经核验是**随机模型**（训练数据上 loss≈ln(12000)、生成死循环）。疑似手写 attention 的 `-inf` 掩码在 bf16 下不稳定 + LR 偏高。修复方向见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
+**进展**：早期全量预训练曾发散（损失塌成假 0、产物为随机模型，根因是手写 attention 的 `-inf` 掩码在 bf16 下不稳定）。已通过对齐 MiniMind（SDPA/RMSNorm/SwiGLU + fp32 loss + 降 lr）修复数值稳定性。**下一步**：重新跑全量预训练验证能生成中文，再做 Stage 1/2。详见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
 
 ---
 

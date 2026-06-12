@@ -4,11 +4,17 @@
 
 ---
 
-## 0. 路线 C：全量语言预训练发散（产物为随机模型）⛔ 阻塞路线 C
+## 0. 路线 C：全量语言预训练发散（产物为随机模型）
 
 **严重度**: 高（路线 C 当前不可用）
 
-**状态**: 待修复
+**状态**: ✅ 数值稳定性已修复（对齐 MiniMind 重写 MiniLLM）；⏳ 待重新训练验证最终效果
+
+> **已做的修复（2026-06-12）**：把 `src/model/llm.py` 的 `MiniLLM` 对齐 MiniMind 重写——
+> 注意力改 `F.scaled_dot_product_attention`（不再手写 `-inf` 掩码）、RMSNorm（fp32）、SwiGLU；
+> `src/pretrain_lm.py` 把 loss 强制 fp32、纯 causal、默认 lr 降到 1e-4、warmup 增至 1000。
+> forward/backward + VLM 集成已 sanity 验证（loss 有限、无 NaN）。**尚未重新跑全量预训练**，
+> 效果待验证（验收标准：能生成连贯中文 + held-out next-token acc 正常）。下方为原始诊断记录。
 
 ### 现象
 - `src/pretrain_lm.py` 的 **smoke（80 step）正常**：loss 9.6 → 7.85，稳步下降。

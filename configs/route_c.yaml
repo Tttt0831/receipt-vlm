@@ -14,7 +14,7 @@ model:
   llm_hidden_size: 1024
   llm_num_layers: 16
   llm_num_heads: 16
-  llm_intermediate_size: 4096
+  llm_intermediate_size: 2752   # SwiGLU 约 8/3·hidden（对齐 MiniMind），≈214M
   projection_intermediate_dim: 4096
 
 data:
