@@ -83,7 +83,7 @@ def main():
     ap.add_argument("--hidden-size", type=int, default=1024)
     ap.add_argument("--num-layers", type=int, default=16)
     ap.add_argument("--num-heads", type=int, default=16)
-    ap.add_argument("--intermediate-size", type=int, default=4096)
+    ap.add_argument("--intermediate-size", type=int, default=2752)
     ap.add_argument("--block-size", type=int, default=512)
     ap.add_argument("--max-lines", type=int, default=300000)
     ap.add_argument("--epochs", type=int, default=2)

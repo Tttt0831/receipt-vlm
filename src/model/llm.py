@@ -255,7 +255,7 @@ class MiniLLM(nn.Module):
 
 if __name__ == "__main__":
     print("Testing MiniLLM (MiniMind-aligned)...")
-    cfg = LLMConfig(vocab_size=12000, hidden_size=1024, num_layers=16, num_heads=16, intermediate_size=4096)
+    cfg = LLMConfig(vocab_size=12000, hidden_size=1024, num_layers=16, num_heads=16, intermediate_size=2752)
     m = MiniLLM(cfg)
     print(f"Total parameters: {m.num_parameters:,}")
 

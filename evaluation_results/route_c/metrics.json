@@ -1,0 +1,19 @@
+{
+  "dataset": "test",
+  "num_samples": 500,
+  "acc_merchant_name": 0.416,
+  "acc_date": 0.524,
+  "acc_total_amount": 0.438,
+  "acc_tax_amount": 0.412,
+  "acc_tax_id": 0.346,
+  "acc_invoice_no": 0.098,
+  "value_match_rate": 0.37233333333333335,
+  "precision": 0.899548532731377,
+  "recall": 0.30760324199150907,
+  "f1": 0.45844118492953695,
+  "ned_merchant_name": 0.44347432362958683,
+  "json_validity_rate": 1.0,
+  "hallucination_rate": 0.2176039119804401,
+  "checkpoint": "checkpoints/route_c/best_model.pt",
+  "trained": true
+}

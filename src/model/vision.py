@@ -183,7 +183,7 @@ class SigLIP2VisionEncoder(nn.Module):
 
         outputs = vision_model(
             pixel_values=pixel_values,
-            attention_mask=attention_mask,
+            pixel_attention_mask=attention_mask,
             spatial_shapes=spatial_shapes,
         )
         last_hidden = outputs.last_hidden_state  # [B, P, hidden]
