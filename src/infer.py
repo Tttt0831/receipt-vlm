@@ -67,10 +67,30 @@ def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 def is_route_b_lora_path(checkpoint_path: Optional[str]) -> bool:
+    """Route B checkpoint: directory with adapter_config.json at root (old) or lora_adapter/ subdir + no meta.pt."""
     if not checkpoint_path:
         return False
     path = Path(checkpoint_path)
-    return path.is_dir() and (path / "adapter_config.json").exists() and (path / "adapter_model.safetensors").exists()
+    if not path.is_dir():
+        return False
+    # 轻量 Route A 也有 lora_adapter/ 子目录，但还有 meta.pt + projection.pt
+    if (path / "meta.pt").exists() and (path / "projection.pt").exists():
+        return False  # Route A lightweight
+    # Old Route B: adapter files at root
+    if (path / "adapter_config.json").exists() and (path / "adapter_model.safetensors").exists():
+        return True
+    # New Route B (if migrated to lora_adapter/ subdir)
+    if (path / "lora_adapter" / "adapter_config.json").exists():
+        return True
+    return False
+
+
+def is_hf_lora_lightweight(checkpoint_path: Optional[str]) -> bool:
+    """检测 Route A 轻量 checkpoint 格式：目录 + meta.pt + projection.pt"""
+    if not checkpoint_path:
+        return False
+    path = Path(checkpoint_path)
+    return path.is_dir() and (path / "meta.pt").exists() and (path / "projection.pt").exists()
 
 
 def build_vlm(checkpoint, tokenizer, device, fallback_vision="google/siglip2-base-patch16-naflex"):
@@ -122,12 +142,57 @@ class ReceiptInference:
                 torch_dtype=torch.bfloat16 if self.device.type == 'cuda' else torch.float32,
                 trust_remote_code=True,
             )
-            self.model = PeftModel.from_pretrained(base_model, checkpoint_path)
+            lora_dir = Path(checkpoint_path) / "lora_adapter"
+            self.model = PeftModel.from_pretrained(
+                base_model, str(lora_dir) if lora_dir.exists() else checkpoint_path)
             self.model.to(self.device)
             self.processor = AutoProcessor.from_pretrained(QWEN2_VL_MODEL, trust_remote_code=True)
             self.has_checkpoint = True
             self.model.eval()
             print(f'✓ Loaded route B LoRA adapter from {checkpoint_path}')
+            print(f'✓ Inference engine ready on {self.device}')
+            return
+
+        # Route A / C: check for lightweight HF LoRA format
+        ckpt_path_obj = Path(checkpoint_path) if checkpoint_path else None
+        if ckpt_path_obj and is_hf_lora_lightweight(str(ckpt_path_obj)):
+            print(f'✓ 检测到轻量 HF LoRA checkpoint: {ckpt_path_obj}')
+            meta = torch.load(ckpt_path_obj / "meta.pt", map_location=self.device, weights_only=False)
+            print('Loading tokenizer...')
+            self.tokenizer = get_tokenizer(tokenizer_name)
+            model = create_vlm_from_config(meta["model_config"]).to(self.device)
+            # 加载 LoRA adapter — 需要先解包 PeftModel 拿到基座
+            lora_dir = ckpt_path_obj / "lora_adapter"
+            if lora_dir.exists():
+                current_model = model.llm.model
+                if hasattr(current_model, 'get_base_model'):
+                    base_transformer = current_model.get_base_model()
+                elif hasattr(current_model, 'model'):
+                    base_transformer = current_model.model
+                else:
+                    base_transformer = current_model
+                model.llm.model = PeftModel.from_pretrained(base_transformer, str(lora_dir))
+                # 更新缓存的组件引用
+                model.llm._embed_tokens = model.llm.model.get_input_embeddings()
+                model.llm._lm_head = model.llm.model.get_output_embeddings()
+            # 加载 projection
+            model.projection.load_state_dict(torch.load(ckpt_path_obj / "projection.pt", map_location=self.device))
+            # 加载视觉可训练部分（如有）
+            vis_path = ckpt_path_obj / "vision_trainable.pt"
+            if vis_path.exists():
+                vis_sd = torch.load(vis_path, map_location=self.device)
+                missing, unexpected = model.load_state_dict(vis_sd, strict=False)
+                print(f'  ✓ 加载视觉可训练权重 (missing={len(missing)}, unexpected={len(unexpected)})')
+            model.pad_token_id = self.tokenizer.pad_token_id
+            model.image_token_id = self.tokenizer.image_token_id
+            model.boa_token_id = self.tokenizer.boa_token_id
+            model.eoa_token_id = self.tokenizer.eoa_token_id
+            self.model = model
+            self.has_checkpoint = True
+            epoch = meta.get("epoch")
+            tail = f" (epoch {epoch + 1})" if epoch is not None else ""
+            print(f'✓ Loaded lightweight checkpoint{tail}')
+            self.model.eval()
             print(f'✓ Inference engine ready on {self.device}')
             return
 

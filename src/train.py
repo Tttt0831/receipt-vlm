@@ -159,6 +159,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--init-from", default=None, help="初始化权重（Stage B 加载 Stage A）")
+    parser.add_argument("--resume", default=None, help="从 checkpoint 恢复训练（加载权重+optimizer+epoch）")
     parser.add_argument("--init-llm", default=None,
                         help="载入 MiniLLM 语言预训练权重（src/pretrain_lm.py 产物）到 model.llm")
     args = parser.parse_args()
@@ -193,12 +194,50 @@ def main():
 
     model.print_trainable_parameters()
 
-    # 初始化权重（Stage B）
+    # 初始化权重（Stage B 或 resume）
+    start_epoch = 1
     init_from = args.init_from or cfg.get("checkpointing", {}).get("resume_from_checkpoint")
-    if init_from and Path(init_from).exists():
-        ckpt = torch.load(init_from, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        print(f"✓ 已从 {init_from} 初始化权重")
+    resume_from = args.resume or cfg.get("checkpointing", {}).get("resume_from_checkpoint")
+
+    def _load_hf_lora_ckpt(ckpt_dir, opt=None):
+        """从 hf_lora 格式的 checkpoint 目录加载权重，可选恢复 optimizer state。
+
+        Args:
+            ckpt_dir: checkpoint 目录路径
+            opt: 如果提供，尝试恢复 optimizer state
+        """
+        ckpt_dir = Path(ckpt_dir)
+        meta = torch.load(ckpt_dir / "meta.pt", map_location=device, weights_only=False)
+        # LoRA adapter — 需要先解包 PeftModel 拿到基座模型再重新包装
+        from peft import PeftModel
+        current_model = model.llm.model
+        if hasattr(current_model, 'get_base_model'):
+            base_transformer = current_model.get_base_model()
+        elif hasattr(current_model, 'model'):
+            base_transformer = current_model.model
+        else:
+            base_transformer = current_model
+        model.llm.model = PeftModel.from_pretrained(
+            base_transformer, str(ckpt_dir / "lora_adapter"), is_trainable=True)
+        # 更新缓存的组件引用
+        model.llm._embed_tokens = model.llm.model.get_input_embeddings()
+        model.llm._lm_head = model.llm.model.get_output_embeddings()
+        # Projection
+        proj_sd = torch.load(ckpt_dir / "projection.pt", map_location=device, weights_only=False)
+        model.projection.load_state_dict(proj_sd)
+        # Vision trainable
+        vis_path = ckpt_dir / "vision_trainable.pt"
+        if vis_path.exists():
+            vis_sd = torch.load(vis_path, map_location=device, weights_only=False)
+            model.load_state_dict(vis_sd, strict=False)
+            print(f"✓ 已载入 vision_trainable: {len(vis_sd)} 个参数")
+        if opt is not None and "optimizer_state_dict" in meta:
+            try:
+                opt.load_state_dict(meta["optimizer_state_dict"])
+                print(f"✓ 已恢复 optimizer state")
+            except Exception as e:
+                print(f"⚠ 恢复 optimizer state 失败（将从头开始）: {e}")
+        return meta.get("epoch", 0), meta.get("val_loss", float("inf"))
 
     # 数据
     data_cfg = cfg.get("data", {})
@@ -229,6 +268,31 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, lr=base_lr,
                                   weight_decay=float(tcfg.get("weight_decay", 0.01)))
 
+    # 恢复/初始化权重（必须在 optimizer 创建之后，以便恢复 optimizer state）
+    if resume_from and Path(resume_from).exists():
+        resume_path = Path(resume_from)
+        if resume_path.is_dir():
+            saved_epoch, saved_val = _load_hf_lora_ckpt(resume_path, opt=optimizer)
+            start_epoch = saved_epoch + 1
+            print(f"✓ 已从 {resume_from} 恢复训练 (epoch {saved_epoch}, val_loss={saved_val:.4f})，"
+                  f"将从 epoch {start_epoch} 继续")
+        else:
+            ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            print(f"✓ 已从 {resume_from} 恢复训练 (epoch {ckpt.get('epoch')})，将从 epoch {start_epoch} 继续")
+    elif init_from and Path(init_from).exists():
+        init_path = Path(init_from)
+        if init_path.is_dir():
+            _load_hf_lora_ckpt(init_path, opt=None)
+            print(f"✓ 已从 {init_from} 初始化权重（仅权重，不恢复 optimizer）")
+        else:
+            ckpt = torch.load(init_from, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"])
+            print(f"✓ 已从 {init_from} 初始化权重")
+
     epochs = tcfg.get("epochs", 3)
     steps_per_epoch = max(1, len(train_loader))
     total_steps = steps_per_epoch * epochs
@@ -242,8 +306,59 @@ def main():
     save_every_n = cfg.get("checkpointing", {}).get("save_every_n_epochs", 0)
     save_from_epoch = cfg.get("checkpointing", {}).get("save_from_epoch", 0)
 
+    is_hf_lora = model.config.llm_type == "hf_lora"
+
+    def _save_checkpoint(epoch, val_loss, path):
+        """保存 checkpoint：HF LoRA 用轻量格式，MiniLLM 用完整 state_dict。"""
+        if is_hf_lora:
+            # 轻量保存：只存 LoRA adapter + projection + meta
+            # 基座权重始终从 HuggingFace 拉取，避免 ~4GB 的 checkpoint 膨胀
+            import shutil
+            tmp = Path(str(path) + ".tmp")
+            tmp.mkdir(parents=True, exist_ok=True)
+            model.llm.model.save_pretrained(str(tmp / "lora_adapter"))
+            torch.save(model.projection.state_dict(), tmp / "projection.pt")
+            # 也保存视觉编码器的可训练部分（如有）
+            # 注意：state_dict() 返回的 tensor 不保留 requires_grad 属性，
+            # 必须用 named_parameters() 获取可训练参数名列表
+            vis_trainable_names = {n for n, p in model.named_parameters()
+                                   if n.startswith("vision_encoder.") and p.requires_grad}
+            vis_sd = {k: v for k, v in model.state_dict().items()
+                      if k in vis_trainable_names}
+            vis_path = tmp / "vision_trainable.pt"
+            torch.save(vis_sd, vis_path) if vis_sd else (vis_path.unlink() if vis_path.exists() else None)
+            torch.save({
+                "model_config": asdict(model.config),
+                "vision_model_name": vision_model_name,
+                "vocab_size": tokenizer.vocab_size,
+                "epoch": epoch,
+                "val_loss": val_loss,
+                "stage": cfg.get("stage", {}).get("name"),
+                "llm_type": "hf_lora",
+                "optimizer_state_dict": optimizer.state_dict(),
+            }, tmp / "meta.pt")
+            # 原子替换
+            if path.exists():
+                shutil.rmtree(str(path), ignore_errors=True)
+            tmp.rename(path)
+            size_mb = sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / (1024*1024)
+            print(f"  ✓ 保存 checkpoint: {path} ({size_mb:.1f}MB, epoch {epoch})")
+        else:
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "vocab_size": tokenizer.vocab_size,
+                "model_config": asdict(model.config),
+                "vision_model_name": vision_model_name,
+                "stage": cfg.get("stage", {}).get("name"),
+            }, path)
+            size_mb = path.stat().st_size / (1024*1024)
+            print(f"  ✓ 保存 checkpoint: {path} ({size_mb:.0f}MB, epoch {epoch})")
+
     best_val = float("inf")
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         train_loss = run_epoch(model, train_loader, optimizer, device, True, epoch,
                                tcfg, total_steps, (epoch - 1) * steps_per_epoch, use_amp)
         with torch.no_grad():
@@ -253,32 +368,12 @@ def main():
 
         # 定期保存 checkpoint（仅在达到 save_from_epoch 后）
         if save_every_n > 0 and epoch % save_every_n == 0 and epoch >= save_from_epoch:
-            epoch_path = out_dir / f"epoch_{epoch}.pt"
-            torch.save({
-                "epoch": epoch - 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
-                "vocab_size": tokenizer.vocab_size,
-                "model_config": asdict(model.config),
-                "vision_model_name": vision_model_name,
-                "stage": cfg.get("stage", {}).get("name"),
-            }, epoch_path)
-            print(f"  ✓ 保存定期 checkpoint: {epoch_path} (epoch {epoch})")
+            epoch_path = out_dir / f"epoch_{epoch}"
+            _save_checkpoint(epoch, val_loss, epoch_path)
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save({
-                "epoch": epoch - 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
-                "vocab_size": tokenizer.vocab_size,
-                "model_config": asdict(model.config),
-                "vision_model_name": vision_model_name,
-                "stage": cfg.get("stage", {}).get("name"),
-            }, best_path)
-            print(f"  ✓ 保存最优 checkpoint: {best_path} (val={val_loss:.4f})")
+            _save_checkpoint(epoch, val_loss, best_path)
 
     print(f"\n训练完成。最优 val loss: {best_val:.4f}")
     print(f"checkpoint: {best_path}")

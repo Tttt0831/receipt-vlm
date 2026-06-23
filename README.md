@@ -29,9 +29,9 @@
 
 | 路线 | 架构 | 可训练部分 | 配置 / 脚本 | 状态 |
 |------|------|-----------|-------------|------|
-| **A** | SigLIP2(冻结) + MLP Projection + **Qwen2-1.5B** LoRA | projection + LoRA + 端层 | `configs/route_a.yaml` · `src/train.py` | ✅ 训练+评估完成 |
-| **B** | **Qwen2-VL-2B-Instruct**(原生 VLM) + LoRA | LoRA 适配器 | `configs/route_b.yaml` · `src/train_qwen2vl_lora.py` | ✅ 训练+评估完成（效果最好） |
-| **C** | SigLIP2(冻结) + MLP Projection + **自制 MiniLLM 214M** | LM 预训练 + projection + 端层 | `configs/route_c.yaml` · `src/pretrain_lm.py` + `src/train.py` | 🚧 WIP（见下方说明） |
+| **A** | SigLIP2(冻结→解冻消融) + MLP Projection + **Qwen2-1.5B** LoRA | projection + LoRA + 解冻视觉顶层 | `configs/route_a*.yaml` · `src/train.py` | ✅ 完成（含2层/4层解冻消融） |
+| **B** | **Qwen2-VL-2B-Instruct**(原生 VLM) + LoRA | LoRA 适配器 | `configs/route_b.yaml` · `src/train_qwen2vl_lora.py` | ✅ 完成（效果最好） |
+| **C** | SigLIP2(冻结) + MLP Projection + **自制 MiniLLM 214M** | LM 预训练 + projection + 端层 | `configs/route_c.yaml` · `src/pretrain_lm.py` + `src/train.py` | ✅ 完成（35M-token预训练评估见 PLAN.md） |
 
 三条路线的多模态融合都走 **LLaVA 风格**：文本序列里放 1 个 `<image>` 占位 token，前向时展开成 N 个视觉 patch embedding（路线 A/C 在 [`src/model/vlm.py`](src/model/vlm.py) 手工实现；路线 B 用 Qwen2-VL 原生处理）。
 
@@ -52,7 +52,7 @@
 - **Stage 0 语言预训练**（[`src/pretrain_lm.py`](src/pretrain_lm.py)）：在 MiniMind 通用中文语料上做 next-token，给随机初始化的 LLM 一个语言先验
 - **Stage 1/2**：再用 `src/train.py --init-llm` 载入预训练权重，做 VLM 对齐 + 票据精调
 
-> ⚠️ **当前状态**：早期全量预训练曾因手写 attention 的 `-inf` 掩码在 bf16 下不稳定而发散（损失塌成假的 0、产物退化为随机模型）。现已**对齐 MiniMind 重写** `MiniLLM`（SDPA 注意力 + RMSNorm + SwiGLU）并把 loss 强制 fp32、降低 lr——数值稳定性问题已修复（forward/backward 已验证），但**尚未重新跑全量预训练验证最终效果**，故路线 C 仍标 WIP、暂无下游结果。详见 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)。
+> ✅ **路线 C 已完成**：214M MiniLLM 经 35M-token 中文语料预训练 + 8 epoch VLM 微调，F1=45.8%，超越路线 A 全部变体。详细训练过程、续写测试、三路线对比见 [PLAN.md](PLAN.md)。
 
 ---
 
@@ -60,55 +60,34 @@
 
 指标定义见 [`src/eval.py`](src/eval.py)：字段 exact-match 准确率、整体 Value Match、字段级 P/R/F1、merchant_name 的 1-NED、JSON 合法率、幻觉率（真值 null 却填值）。
 
-### 字段级准确率
+### 三路线 + Route A 消融 完整对比
 
-| 字段 | 路线 A | 路线 B |
-|------|:-----:|:-----:|
-| merchant_name | 2.80% | 23.40% |
-| date | 0.00% | 36.60% |
-| total_amount | 0.00% | 67.20% |
-| tax_amount | 20.60% | 74.60% |
-| tax_id | 33.40% | 41.60% |
-| invoice_no | 22.20% | 41.60% |
+| 字段 | 路线A(冻结) | A(2层JFT) | **A(4层JFT)** | 路线B | **路线C** |
+|------|:----------:|:---------:|:------------:|:-----:|:--------:|
+| merchant_name | 2.80% | 38.40% | **41.00%** | 23.40% | **41.60%** |
+| date | 0.00% | 0.40% | **0.60%** | 36.60% | **52.40%** |
+| total_amount | 0.00% | 0.00% | 0.00% | **67.20%** | 43.80% |
+| tax_amount | 20.60% | 20.60% | **21.60%** | **74.60%** | 41.20% |
+| tax_id | 33.40% | 33.80% | **35.00%** | **41.60%** | 34.60% |
+| invoice_no | 22.20% | 12.00% | **13.00%** | **41.60%** | 9.80% |
 
-### 总体指标
+| 总体 | 路线A(冻结) | A(2层JFT) | **A(4层JFT)** | 路线B | **路线C** |
+|------|:----------:|:---------:|:------------:|:-----:|:--------:|
+| Value Match | 13.17% | 17.53% | **18.53%** | **47.50%** | 37.23% |
+| Precision | 72.22% | 77.32% | 75.09% | 94.70% | **89.95%** |
+| Recall | 0.99% | 7.94% | **8.49%** | **42.27%** | 30.76% |
+| **F1** | 1.96% | 14.39% | **15.26%** | **58.45%** | 45.84% |
+| 1-NED(merchant)↓ | 0.7969 | 0.4746 | **0.4493** | 0.6555 | **0.4435** |
+| JSON 合法率 | 100% | 100% | 100% | 100% | 100% |
+| 幻觉率 | 2.64% | 16.09% | 17.85% | 16.36% | 21.76% |
 
-| 指标 | 路线 A | 路线 B |
-|------|:-----:|:-----:|
-| Value Match Rate | 13.17% | **47.50%** |
-| Precision | 72.22% | 94.70% |
-| Recall | 0.99% | **42.27%** |
-| F1 Score | 1.96% | **58.45%** |
-| 1-NED (merchant_name) | 0.7969 | 0.6555 |
-| JSON 合法率 | 100% | 100% |
-| 幻觉率 | 2.64% | 16.36% |
+> 结果文件：[`evaluation_results/route_a/`](evaluation_results/route_a) · [`evaluation_results/route_a_jointft/`](evaluation_results/route_a_jointft) · [`evaluation_results/route_a_jointft_4l/`](evaluation_results/route_a_jointft_4l) · [`evaluation_results/route_b/`](evaluation_results/route_b) · [`evaluation_results/route_c/`](evaluation_results/route_c)
 
-> 结果文件：[`evaluation_results/route_a/`](evaluation_results/route_a) · [`evaluation_results/route_b/`](evaluation_results/route_b)
-
-**结论**：
-- **路线 B 明显领先**，金额字段（total/tax）表现好；merchant_name 仍是短板。
-- **路线 A 基线效果很差**：JSON 格式 100% 合法，但内容基本是**幻觉**——输出一张"看起来像"的票据而非真正读图（缺乏视觉接地）。Recall≈1% 部分由模型不输出 `<eoa>`、生成停不下来导致；[`src/infer.py`](src/infer.py) 已加入"取第一个配平 JSON 对象"的容错提取。
-
-### 路线 A 消融：冻结视觉 vs 视觉+投影联合微调
-
-针对"缺乏视觉接地"的问题，做了对照实验：基线把 SigLIP2 全冻结，变体（[`configs/route_a_jointft.yaml`](configs/route_a_jointft.yaml)）解冻 SigLIP2 **顶部 2 层 + post_layernorm** 与 projection、LoRA 联合微调（视觉用 1/10 的小 lr）。两者都训 5 epoch、同一测试集。
-
-| 指标 | A 基线（冻结视觉） | **A 联合微调（解冻顶部2层）** |
-|------|:-----------------:|:----------------------------:|
-| merchant_name | 2.80% | **38.40%** |
-| date | 0.00% | 0.40% |
-| total_amount | 0.00% | 0.00% |
-| tax_amount | 20.60% | 20.60% |
-| tax_id | 33.40% | 33.80% |
-| invoice_no | 22.20% | 12.00% |
-| Value Match Rate | 13.17% | **17.53%** |
-| Recall | 0.99% | **7.94%** |
-| F1 Score | 1.96% | **14.39%** |
-| val loss | 0.873 | **0.847** |
-
-> 结果文件：[`evaluation_results/route_a/`](evaluation_results/route_a)（基线）· [`evaluation_results/route_a_jointft/`](evaluation_results/route_a_jointft)（联合微调）
-
-**发现**：解冻视觉**显著增强了接地**——merchant_name 从 2.8% 跃升到 **38.4%**，F1 翻约 7 倍，模型开始真正"读出"商户名。但 **total_amount / date 仍为 0**：密集小数字的接地更难，仅解冻顶部 2 层 + 短训不足以覆盖。后续方向：解冻更多视觉层、提高 `max_num_patches`、更长训练、对数字字段加权。
+**核心结论**：
+- **路线 B 总体领先**（F1 58.5%），金额字段优势明显；merchant_name 是短板
+- **路线 C 性价比最优**：214M 小模型 F1 达 45.8%，文本字段（merchant_name/date）甚至超过路线 B
+- **路线 A 需要视觉解冻**：冻结视觉 → 完全幻觉（F1 1.96%），解冻2层 → F1 14.4%，4层 → F1 15.3%
+- **路线 A 的瓶颈不在视觉层数**：4层 vs 2层仅 +0.9pp F1，total_amount 始终为 0%
 
 ---
 
@@ -126,7 +105,7 @@
 
 val 在第 4–5 epoch 基本收敛（边际收益递减）。注意：低 train/val loss ≠ 高抽取准确率——见上文"缺乏视觉接地"。
 
-**路线 A 联合微调**（解冻视觉顶部 2 层，`configs/route_a_jointft.yaml`，5 epoch）：
+**路线 A 联合微调 2层**（解冻视觉顶部 2 层，[`configs/route_a_jointft.yaml`](configs/route_a_jointft.yaml)，5 epoch）：
 
 | Epoch | Train Loss | Val Loss |
 |:-----:|:----------:|:--------:|
@@ -138,12 +117,41 @@ val 在第 4–5 epoch 基本收敛（边际收益递减）。注意：低 train
 
 解冻视觉后 val loss（0.847）低于基线（0.873），且抽取指标显著改善（见上方消融表）。
 
+**路线 A 联合微调 4层**（解冻视觉顶部 4 层，[`configs/route_a_jointft_4l.yaml`](configs/route_a_jointft_4l.yaml)，5 epoch，从 epoch 2 checkpoint 恢复）：
+
+| Epoch | Train Loss | Val Loss |
+|:-----:|:----------:|:--------:|
+| 1 | 1.0607 | 0.8897 |
+| 2 | 0.8918 | 0.8656 |
+| 3 | 0.8744 | 0.8584 |
+| 4 | 0.8699 | **0.8574** |
+| 5 | 0.8688 | 0.8576 |
+
+4层 val loss（0.8574）略高于 2 层版本（0.8469），但抽取指标仍有小幅提升（F1 14.4% → 15.3%）。视觉层数增加带来的边际收益递减。
+
 ### 路线 B（`configs/route_b.yaml`，5 epoch，bs=2，grad_accum=8）
 训练 5 epoch 后达到上表评估指标（per-epoch 曲线未单独留存）。
 
-### 路线 C（语言预训练，214M MiniLLM）
-- 早期全量（102k step）发散：loss ~4000 step 后塌成假 0、产物为随机模型。
-- 已对齐 MiniMind 重写（SDPA/RMSNorm/SwiGLU + fp32 loss + 降 lr），数值稳定性已修；**待重新训练补曲线**。
+### 路线 C（214M MiniLLM，35M-token 中文预训练 + 8 epoch VLM）
+
+**语言预训练**（2 epoch, MiniMind 中文语料）：
+- Loss: 9.60 → 2.08（ppl 14707 → 8.0），无 NaN/发散
+- 预训练后 next-token 准确率 42.9%，能生成连贯中文，无重复
+
+**VLM 训练**（8 epoch, 3000/500 合成票据）：
+
+| Epoch | Train Loss | Val Loss |
+|:-----:|:----------:|:--------:|
+| 1 | 1.5156 | 1.0205 |
+| 2 | 1.0172 | 0.9826 |
+| 3 | 0.9826 | 0.9548 |
+| 4 | 0.9191 | 0.8848 |
+| 5 | 0.7947 | 0.7424 |
+| 6 | 0.6645 | 0.6807 |
+| 7 | 0.5905 | **0.6763** |
+| 8 | 0.5567 | 0.6789 |
+
+最佳 val loss 0.6763（Epoch 7），远优于路线 A 基线 0.873。仅 214M 参数达到 F1=45.8%，超越路线 A 的 1.5B 参数方案。详见 [PLAN.md](PLAN.md)。
 
 ---
 
@@ -155,9 +163,11 @@ receipt-vlm/
 ├── PLAN.md                      # 当前进度与结论
 ├── requirements.txt
 ├── configs/
-│   ├── route_a.yaml             # 路线A: SigLIP2 + Qwen2-1.5B LoRA
-│   ├── route_b.yaml             # 路线B: Qwen2-VL-2B LoRA
-│   └── route_c.yaml             # 路线C: SigLIP2 + 自制 MiniLLM 214M
+│   ├── route_a.yaml               # 路线A: SigLIP2(冻结) + Qwen2-1.5B LoRA
+│   ├── route_a_jointft.yaml        # 路线A消融: 视觉解冻2层 + 联合微调
+│   ├── route_a_jointft_4l.yaml     # 路线A消融: 视觉解冻4层 + 联合微调
+│   ├── route_b.yaml                # 路线B: Qwen2-VL-2B LoRA
+│   └── route_c.yaml                # 路线C: SigLIP2 + 自制 MiniLLM 214M
 ├── src/
 │   ├── train.py                 # 路线 A/C 训练（config 驱动，--init-llm 载入预训练 LLM）
 │   ├── train_qwen2vl_lora.py    # 路线 B 训练（支持 --config）
@@ -172,7 +182,10 @@ receipt-vlm/
 │   ├── ROUTES.md                # 三路线详解
 │   └── KNOWN_ISSUES.md          # 已知问题（含路线A ckpt 膨胀、路线C 预训练不稳定）
 ├── tokenizers/receipt-bpe/      # 路线C 自训练 BPE（已入库）
-└── evaluation_results/          # 路线 A/B 评估指标（小文件，已入库）
+└── evaluation_results/          # 路线 A/B/C 评估指标（小文件，已入库）
+    ├── route_a/ route_a_jointft/ route_a_jointft_4l/
+    ├── route_b/
+    └── route_c/
 ```
 
 > 数据集与 checkpoint 体积大，**不入库**（见 `.gitignore`）：`data/`、`checkpoints/`、`*.pt`、`*.log`。
@@ -187,8 +200,10 @@ pip install -r requirements.txt
 # 0) 生成合成数据（3000/500/500）
 python -m src.data.synth
 
-# 路线 A：训练 + 评估
+# 路线 A：训练 + 评估（含联合微调消融）
 python -m src.train --config configs/route_a.yaml --epochs 5 --batch-size 2
+python -m src.train --config configs/route_a_jointft.yaml --epochs 5 --batch-size 2
+python -m src.train --config configs/route_a_jointft_4l.yaml --epochs 5 --batch-size 2
 python -m src.run_eval --checkpoint checkpoints/route_a/best_model.pt \
     --data data/synthetic/test/test.jsonl --tokenizer Qwen/Qwen2-1.5B \
     --output evaluation_results/route_a
